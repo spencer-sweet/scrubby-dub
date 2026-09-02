@@ -1,0 +1,90 @@
+@import 'lenis/dist/lenis.css';
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #f5f5f5;
+  background: #0a0a0a;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html { background: #0a0a0a; }
+body { margin: 0; background: #0a0a0a; }
+
+.hero {
+  min-height: 220vh;
+  position: relative;
+}
+
+.hud {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 5;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 28px 32px;
+  pointer-events: none;
+}
+
+.hud > * { pointer-events: auto; }
+
+.eyebrow, .status, .hint, .controls, .file-input, .toggle, .spacer span {
+  font: 500 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.eyebrow { opacity: .6; }
+h1 { font-size: clamp(48px, 7vw, 108px); line-height: .88; letter-spacing: -.06em; margin: 16px 0 0; }
+h1 em { font-family: Georgia, serif; font-weight: 400; }
+
+.controls { display: flex; gap: 18px; align-items: center; }
+.toggle { display: flex; gap: 9px; align-items: center; cursor: pointer; }
+.toggle input { display: none; }
+.switch { width: 34px; height: 20px; border: 1px solid #777; border-radius: 99px; position: relative; }
+.switch::after { content: ''; position: absolute; width: 12px; height: 12px; left: 3px; top: 3px; background: #777; border-radius: 50%; transition: transform .2s ease; }
+.toggle input:checked + .switch::after { transform: translateX(14px); background: white; }
+
+.file-input { cursor: pointer; border-bottom: 1px solid #777; padding-bottom: 4px; }
+.file-input input { display: none; }
+
+.scrub-stage {
+  position: sticky;
+  top: 0;
+  height: 100svh;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+#video-canvas {
+  width: min(92vw, 1280px);
+  max-height: 76svh;
+  object-fit: contain;
+  display: block;
+}
+
+.loading { position: absolute; font: 12px ui-monospace, monospace; opacity: .7; }
+.status { position: absolute; right: 32px; bottom: 28px; opacity: .7; }
+.hint { position: absolute; left: 32px; bottom: 28px; opacity: .5; }
+
+.spacer {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 12vw;
+}
+.spacer > div { max-width: 720px; }
+.spacer h2 { font-size: clamp(42px, 7vw, 96px); line-height: .95; letter-spacing: -.05em; margin: 24px 0; }
+.spacer p { max-width: 520px; color: #999; font-size: 18px; line-height: 1.5; }
+.spacer.dark { background: #151515; }
+
+@media (max-width: 700px) {
+  .hud { padding: 18px; }
+  .controls { margin-top: 8px; flex-direction: column; align-items: flex-end; gap: 12px; }
+  .status { right: 18px; bottom: 18px; }
+  .hint { left: 18px; bottom: 18px; }
+  .scrub-stage { height: 100svh; }
+  #video-canvas { width: 94vw; max-height: 60svh; }
+}
