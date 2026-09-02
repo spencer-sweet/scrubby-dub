@@ -20,7 +20,15 @@ npm install
 npm run dev
 ```
 
-Open the local Vite URL.
+Open the local Vite URL (dev is served under `/scrubby-dub/`).
+
+To publish on GitHub Pages from the `docs/` folder:
+
+```bash
+npm run build
+```
+
+That writes into `docs/` with asset URLs under `/scrubby-dub/`, which matches [https://spencer-sweet.github.io/scrubby-dub/](https://spencer-sweet.github.io/scrubby-dub/).
 
 ## Production notes
 

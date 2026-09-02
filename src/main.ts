@@ -250,7 +250,7 @@ window.addEventListener('resize', () => {
   if (!lenis) updateFromProgress(getNativeProgress());
 });
 
-loadVideo('/7d-200fps.mp4').catch((error) => {
+loadVideo(`${import.meta.env.BASE_URL}7d-200fps.mp4`).catch((error) => {
   loading.hidden = false;
   loading.textContent = 'Demo video failed to load. Choose a video above.';
   console.error(error);
