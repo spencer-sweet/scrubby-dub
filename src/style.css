@@ -35,27 +35,38 @@ body { margin: 0; background: #0a0a0a; }
   text-transform: uppercase;
 }
 
-.eyebrow { opacity: .6; }
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: inherit;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: .02em;
+  opacity: .6;
+}
+.eyebrow svg { display: block; flex: 0 0 auto; }
+.eyebrow:hover { opacity: 1; }
 h1 { font-size: clamp(48px, 7vw, 108px); line-height: .88; letter-spacing: -.06em; margin: 16px 0 0; }
 h1 em { font-family: Georgia, serif; font-weight: 400; }
 
-.controls { display: flex; gap: 18px; align-items: center; }
-.toggle { display: flex; gap: 9px; align-items: center; cursor: pointer; }
+.controls { display: flex; gap: 18px; align-items: center; height: 20px; }
+.toggle { display: flex; gap: 9px; align-items: center; cursor: pointer; height: 20px; }
 .toggle input { display: none; }
-.switch { width: 34px; height: 20px; border: 1px solid #777; border-radius: 99px; position: relative; }
+.switch { display: block; flex: 0 0 auto; width: 34px; height: 20px; border: 1px solid #777; border-radius: 99px; position: relative; }
 .switch::after { content: ''; position: absolute; width: 12px; height: 12px; left: 3px; top: 3px; background: #777; border-radius: 50%; transition: transform .2s ease; }
 .toggle input:checked + .switch::after { transform: translateX(14px); background: white; }
 
-.file-input { cursor: pointer; border-bottom: 1px solid #777; padding-bottom: 4px; }
-.file-input input { display: none; }
-
-.github-link {
+.file-input {
+  cursor: pointer;
   display: inline-flex;
-  color: #f5f5f5;
-  opacity: .7;
-  line-height: 0;
+  align-items: center;
+  height: 20px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
 }
-.github-link:hover { opacity: 1; }
+.file-input input { display: none; }
 
 .scrub-stage {
   position: sticky;
@@ -95,8 +106,23 @@ h1 em { font-family: Georgia, serif; font-weight: 400; }
 .spacer.dark { background: #151515; }
 
 @media (max-width: 700px) {
-  .hud { padding: 18px; }
-  .controls { margin-top: 8px; flex-direction: column; align-items: flex-end; gap: 12px; }
+  .hud {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 18px;
+    column-gap: 12px;
+  }
+  .brand { display: contents; }
+  .eyebrow { grid-column: 1; grid-row: 1; }
+  .controls {
+    grid-column: 2;
+    grid-row: 1;
+    gap: 12px;
+    margin: 0;
+    height: 20px;
+  }
+  h1 { grid-column: 1 / -1; grid-row: 2; }
   .status { right: 18px; bottom: 18px; }
   .hint { left: 18px; bottom: 18px; }
   .scrub-stage { height: 100svh; }

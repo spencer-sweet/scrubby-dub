@@ -15,8 +15,18 @@ app.innerHTML = `
   <main>
     <section class="hero">
       <div class="hud">
-        <div>
-          <span class="eyebrow">scrubby-dub</span>
+        <div class="brand">
+          <a
+            class="eyebrow"
+            href="https://github.com/spencer-sweet/scrubby-dub"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/>
+            </svg>
+            spencer-sweet/scrubby-dub
+          </a>
           <h1>Scroll-controlled<br><em>video.</em></h1>
         </div>
         <div class="controls">
@@ -29,17 +39,6 @@ app.innerHTML = `
             <span>Load video</span>
             <input id="video-file" type="file" accept="video/*,.mp4,.webm,.mov" />
           </label>
-          <a
-            class="github-link"
-            href="https://github.com/spencer-sweet/scrubby-dub"
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label="View scrubby-dub on GitHub"
-          >
-            <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true">
-              <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/>
-            </svg>
-          </a>
         </div>
       </div>
 
@@ -49,27 +48,8 @@ app.innerHTML = `
         <div class="status" id="status">0.0s · 0%</div>
       </div>
 
-      <div class="hint">Scroll to scrub · toggle Lenis on or off</div>
+      <div class="hint">Scroll to scrub</div>
     </section>
-
-
-
-    <!--
-    <section class="spacer">
-      <div>
-        <span>01</span>
-        <h2>One scroll position.<br/>One requested frame.</h2>
-        <p>Mediabunny decodes the frame corresponding to the current scroll position. The demo only asks for a new frame when the target timestamp changes.</p>
-      </div>
-    </section>
-    <section class="spacer dark">
-      <div>
-        <span>02</span>
-        <h2>Lenis is optional.</h2>
-        <p>Turn it off to drive the same decoder directly from window.scrollY. Turn it on to let Lenis provide the smooth, physics-based scroll value.</p>
-      </div>
-    </section>
-    -->
 
   </main>
 `;
