@@ -4,7 +4,6 @@ A small, intentionally dependency-light demo for **frame-accurate-ish scroll scr
 
 <img width="793" height="882" alt="Screenshot 1536" src="https://github.com/user-attachments/assets/587e1341-2173-4fbe-8765-57ecac83424c" />
 
-
 ## What it demonstrates
 
 - Native `window.scrollY` → video timestamp.
@@ -36,3 +35,6 @@ For a production scroll sequence:
 5. If the source is very long or very high resolution, consider a dedicated worker/rendering architecture and lower-resolution preview assets.
 
 Mediabunny's `CanvasSink` is useful here because it retrieves decoded frames at timestamps and can reuse a canvas pool. Its `getCanvas()` call returns the last frame at or before the requested timestamp. See the Mediabunny docs for the underlying behavior.
+
+## Acknowledgements
+- Demo footage is a snippet from [Oton Bacar](https://vimeo.com/17439665)'s rad video on Vimeo

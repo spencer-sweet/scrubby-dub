@@ -74,8 +74,9 @@ let input: Input | null = null;
 let track: InputVideoTrack | null = null;
 let sink: VideoSampleSink | null = null;
 let duration = 0;
-let currentTimestamp = -1;
-let requestId = 0;
+let targetTimestamp = 0;
+let decodedTimestamp = -1;
+let pumping = false;
 let sourceUrl: string | null = null;
 let lenis: Lenis | null = null;
 
@@ -87,7 +88,12 @@ async function loadVideo(source: Blob | string) {
   input = null;
   track = null;
   sink = null;
-  currentTimestamp = -1;
+  targetTimestamp = 0;
+  decodedTimestamp = -1;
+
+  while (pumping) {
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+  }
 
   const mediaSource = typeof source === 'string'
     ? new UrlSource(source)
@@ -110,38 +116,60 @@ async function loadVideo(source: Blob | string) {
 
   canvas.width = width;
   canvas.height = height;
-  // VideoSampleSink gives us the decoded VideoSample directly. Drawing it
-  // straight to our persistent canvas avoids allocating a canvas per seek.
+  // One VideoSampleSink; getSample still opens a decoder per call, so we
+  // never run more than one of those at a time (see pumpFrames).
   sink = new VideoSampleSink(track, {
-    hardwareAcceleration: 'prefer-hardware',
+    optimizeForLatency: true,
   });
 
   loading.textContent = 'Ready';
   loading.hidden = true;
-  await requestFrame(0);
+  await pumpFrames();
 }
 
-async function requestFrame(timestamp: number) {
-  if (!sink || duration <= 0) return;
+function timestampEpsilon() {
+  return duration > 0 ? Math.max(duration / 10_000, 1 / 240) : 1 / 240;
+}
 
-  // Quantize to the actual video frame cadence enough to avoid duplicate work
-  // while scrolling. Mediabunny returns the presentation frame at/before the timestamp.
-  const clamped = Math.max(0, Math.min(duration, timestamp));
-  if (Math.abs(clamped - currentTimestamp) < 1 / 120) return;
-  currentTimestamp = clamped;
+async function pumpFrames() {
+  if (pumping || !sink || duration <= 0) return;
+  pumping = true;
 
-  const id = ++requestId;
-  const sample = await sink.getSample(clamped);
+  try {
+    while (sink) {
+      const timestamp = targetTimestamp;
+      if (Math.abs(timestamp - decodedTimestamp) < timestampEpsilon()) break;
 
-  // A newer scroll position won the race; don't paint an obsolete frame.
-  if (id !== requestId || !sample) {
-    sample?.close();
-    return;
+      const activeSink = sink;
+      let sample = null;
+      try {
+        sample = await activeSink.getSample(timestamp);
+      } catch (error) {
+        if (!sink) break;
+        console.error(error);
+        decodedTimestamp = timestamp;
+        break;
+      }
+
+      if (!sink) {
+        sample?.close();
+        break;
+      }
+
+      if (sample) {
+        sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+        sample.close();
+      }
+
+      decodedTimestamp = timestamp;
+    }
+  } finally {
+    pumping = false;
   }
 
-  sample.draw(ctx, 0, 0, canvas.width, canvas.height);
-  status.textContent = `${sample.timestamp.toFixed(2)}s · ${(sample.timestamp / duration * 100).toFixed(1)}%`;
-  sample.close();
+  if (sink && Math.abs(targetTimestamp - decodedTimestamp) >= timestampEpsilon()) {
+    void pumpFrames();
+  }
 }
 
 function getNativeProgress() {
@@ -150,7 +178,12 @@ function getNativeProgress() {
 }
 
 function updateFromProgress(progress: number) {
-  requestFrame(progress * duration);
+  const clamped = Math.min(1, Math.max(0, progress));
+  status.textContent = `${(clamped * duration).toFixed(2)}s · ${(clamped * 100).toFixed(1)}%`;
+  if (duration <= 0 || !sink) return;
+
+  targetTimestamp = clamped * duration;
+  void pumpFrames();
 }
 
 function onLenisScroll({ scroll, limit }: { scroll: number; limit: number }) {
