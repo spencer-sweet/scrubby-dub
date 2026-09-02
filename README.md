@@ -2,7 +2,8 @@
 
 A small, intentionally dependency-light demo for **frame-accurate-ish scroll scrubbing** with [Mediabunny](https://mediabunny.dev/) and optional [Lenis](https://lenis.darkroom.engineering/).
 
-<img width="793" height="882" alt="Screenshot 1536" src="https://github.com/user-attachments/assets/587e1341-2173-4fbe-8765-57ecac83424c" />
+<img width="1066" height="779" alt="Screenshot 1537" src="https://github.com/user-attachments/assets/05092f31-d91a-4be6-b4d3-f03962521acd" />
+
 
 ## What it demonstrates
 
