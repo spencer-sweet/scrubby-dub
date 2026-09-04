@@ -37,7 +37,9 @@ tmp_file="$tmp_dir/reencoded.mp4"
 echo "Re-encoding $input with a ${gop}-frame GOP at CRF ${crf}..."
 ffmpeg -y -i "$input" \
   -c:v libx264 -preset medium -crf "$crf" \
+  -profile:v high -pix_fmt yuv420p -bf 0 \
   -g "$gop" -keyint_min "$gop" -sc_threshold 0 \
+  -movflags +faststart \
   -c:a copy \
   "$tmp_file"
 
