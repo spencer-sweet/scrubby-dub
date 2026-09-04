@@ -87,12 +87,13 @@ const isAndroid = /Android/i.test(navigator.userAgent) || uaData?.platform === '
 const isMobileClient = uaData?.mobile === true;
 const isCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
 
-// Chrome on Android (and many device labs) expose VideoDecoder but MediaCodec
-// often rejects Mediabunny's H.264 configs, or a "virtual" Android Chrome
-// reports a desktop UA. Prefer the HTML <video> path on anything that looks
-// like a phone so the orange fallback chrome is actually what you see there.
+// Only bail out when WebCodecs genuinely doesn't exist. Chrome on Android
+// does support VideoDecoder; the jumpiness we used to see there came from
+// how the decode loop drove it (blocking flush()-per-seek, no backpressure
+// awareness), not from the API being unusable. Runtime decode failures are
+// caught below and fall back to the HTML <video> path automatically.
 function preferHtmlVideoPlayback() {
-  return isAndroid || isMobileClient || isCoarsePointer || typeof VideoDecoder !== 'function';
+  return typeof VideoDecoder !== 'function';
 }
 
 const FRAME_CACHE_BUDGET_BYTES = (isAndroid || isMobileClient ? 48 : 256) * 1024 * 1024;
@@ -101,10 +102,15 @@ type WebCodecsSession = {
   kind: 'webcodecs';
   packetSink: EncodedPacketSink;
   decoder: VideoDecoder;
+  decoderConfig: VideoDecoderConfig;
   rotation: Rotation;
   displayWidth: number;
   displayHeight: number;
-  latestFrame: VideoFrame | null;
+  // Sequence number of the frame currently on screen, and the one we
+  // actually want there. The decoder's output callback compares the two
+  // to decide whether a just-decoded frame is still relevant or stale.
+  decodedSequence: number | null;
+  desiredSequence: number | null;
   frameCache: Map<number, VideoFrame>;
   maxCachedFrames: number;
   pendingSequenceByTimestamp: Map<number, number>;
@@ -185,7 +191,6 @@ function setPlaybackSurface(mode: 'webcodecs' | 'html') {
 
 function teardownSession() {
   if (activeSession?.kind === 'webcodecs') {
-    activeSession.latestFrame?.close();
     for (const frame of activeSession.frameCache.values()) frame.close();
     try {
       activeSession.decoder.close();
@@ -208,7 +213,10 @@ function teardownSession() {
   setPlaybackSurface('webcodecs');
 }
 
-async function configureDecoder(decoder: VideoDecoder, base: VideoDecoderConfig) {
+async function configureDecoder(
+  decoder: VideoDecoder,
+  base: VideoDecoderConfig
+): Promise<VideoDecoderConfig> {
   const attempts: VideoDecoderConfig[] = [
     { ...base, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' },
     { ...base, hardwareAcceleration: 'prefer-software' },
@@ -223,7 +231,7 @@ async function configureDecoder(decoder: VideoDecoder, base: VideoDecoderConfig)
         if (!supported) continue;
       }
       decoder.configure(config);
-      return;
+      return config;
     } catch {
       // Try the next, more conservative config.
     }
@@ -287,7 +295,7 @@ async function loadWithHtmlVideo(source: Blob | string) {
   loading.textContent = 'Ready';
   loading.hidden = true;
   updateFromProgress(getNativeProgress());
-  void runDecodeLoop(session);
+  void runDecodeLoop(session, source);
 }
 
 async function loadWithWebCodecs(source: Blob | string) {
@@ -313,8 +321,8 @@ async function loadWithWebCodecs(source: Blob | string) {
   const displayWidth = await track.getDisplayWidth();
   const displayHeight = await track.getDisplayHeight();
   const rotation = await track.getRotation();
-  const decoderConfig = await track.getDecoderConfig();
-  if (!decoderConfig) throw new Error('Could not determine a decoder configuration for this track.');
+  const trackDecoderConfig = await track.getDecoderConfig();
+  if (!trackDecoderConfig) throw new Error('Could not determine a decoder configuration for this track.');
 
   canvas.width = displayWidth;
   canvas.height = displayHeight;
@@ -326,32 +334,51 @@ async function loadWithWebCodecs(source: Blob | string) {
     kind: 'webcodecs',
     packetSink: new EncodedPacketSink(track),
     decoder: new VideoDecoder({
+      // Every decoded frame is cached (so re-visiting it later is instant),
+      // but it's only drawn if it's still the frame we currently want. Scrub
+      // fast past it and the frame this callback sees will already be stale
+      // by the time it arrives — that's expected, not an error, so we just
+      // drop it instead of blocking the next request on it.
       output: (frame) => {
         const sequenceNumber = session.pendingSequenceByTimestamp.get(frame.timestamp);
-        if (sequenceNumber !== undefined) {
-          cachePut(session, sequenceNumber, frame.clone());
+        session.pendingSequenceByTimestamp.delete(frame.timestamp);
+
+        if (sequenceNumber === undefined) {
+          frame.close();
+          return;
         }
 
-        session.latestFrame?.close();
-        session.latestFrame = frame;
+        cachePut(session, sequenceNumber, frame.clone());
+
+        if (sequenceNumber !== session.desiredSequence) {
+          frame.close();
+          return;
+        }
+
+        session.decodedSequence = sequenceNumber;
+        drawAndCloseFrame(session, frame);
       },
-      error: (error) => console.error(error),
+      error: (error) => {
+        void fallbackToHtmlVideo(session, source, error);
+      },
     }),
+    decoderConfig: trackDecoderConfig,
     rotation,
     displayWidth,
     displayHeight,
-    latestFrame: null,
+    decodedSequence: null,
+    desiredSequence: null,
     frameCache: new Map(),
     maxCachedFrames,
     pendingSequenceByTimestamp: new Map(),
   };
-  await configureDecoder(session.decoder, decoderConfig);
+  session.decoderConfig = await configureDecoder(session.decoder, trackDecoderConfig);
   activeSession = session;
 
   loading.textContent = 'Ready';
   loading.hidden = true;
   updateFromProgress(getNativeProgress());
-  void runDecodeLoop(session);
+  void runDecodeLoop(session, source);
 }
 
 async function loadVideo(source: Blob | string) {
@@ -399,22 +426,53 @@ async function decodeToTimestamp(session: WebCodecsSession, timestamp: number) {
   const targetPacket = await session.packetSink.getPacket(timestamp);
   if (!targetPacket) return;
 
+  session.desiredSequence = targetPacket.sequenceNumber;
+
   const cached = cacheGet(session, targetPacket.sequenceNumber);
   if (cached) {
+    session.decodedSequence = targetPacket.sequenceNumber;
     drawAndCloseFrame(session, cached.clone());
     return;
   }
 
-  const keyPacket = await session.packetSink.getKeyPacket(timestamp);
-  if (!keyPacket) return;
+  // Scrolling forward at a normal pace asks for "the next frame" almost
+  // every tick. Treat that like ordinary playback — decode just the one
+  // delta packet — instead of re-deriving from the last keyframe every
+  // time. This is the main reason this now stays smooth on weaker/mobile
+  // hardware decoders: most requests become a single cheap decode() call
+  // instead of a multi-frame reset-and-replay.
+  const isSequential =
+    session.decodedSequence !== null &&
+    targetPacket.sequenceNumber === session.decodedSequence + 1 &&
+    targetPacket.type === 'delta';
 
-  session.pendingSequenceByTimestamp.clear();
+  if (isSequential) {
+    const chunk = targetPacket.toEncodedVideoChunk();
+    session.pendingSequenceByTimestamp.set(chunk.timestamp, targetPacket.sequenceNumber);
+    session.decoder.decode(chunk);
+    requestFlush(session);
+    return;
+  }
+
+  // A real jump: if the decoder still has undelivered work queued, drop it
+  // rather than let it drain — otherwise a burst of scroll input makes the
+  // picture visibly "catch up" late, which is what reads as jumpy/laggy.
+  if (session.decoder.decodeQueueSize > 0 || session.decoder.state !== 'configured') {
+    session.decoder.reset();
+    session.decoder.configure(session.decoderConfig);
+    session.pendingSequenceByTimestamp.clear();
+  }
+
+  const keyPacket = targetPacket.type === 'key'
+    ? targetPacket
+    : await session.packetSink.getKeyPacket(timestamp);
+  if (!keyPacket) return;
 
   const keyChunk = keyPacket.toEncodedVideoChunk();
   session.pendingSequenceByTimestamp.set(keyChunk.timestamp, keyPacket.sequenceNumber);
   session.decoder.decode(keyChunk);
-  let cursor = keyPacket;
 
+  let cursor = keyPacket;
   while (cursor.sequenceNumber < targetPacket.sequenceNumber) {
     const next = await session.packetSink.getNextPacket(cursor);
     if (!next) break;
@@ -424,17 +482,29 @@ async function decodeToTimestamp(session: WebCodecsSession, timestamp: number) {
     cursor = next;
   }
 
-  await session.decoder.flush();
-  session.pendingSequenceByTimestamp.clear();
-
-  if (session.latestFrame) {
-    const frame = session.latestFrame;
-    session.latestFrame = null;
-    drawAndCloseFrame(session, frame);
-  }
+  requestFlush(session);
 }
 
-async function runDecodeLoop(session: DecodeSession) {
+// Some decoder backends buffer internally and won't emit a frame from
+// decode() alone — flush() is what forces delivery. We still need it, but
+// firing it without awaiting keeps the scrub loop from blocking on it: the
+// output callback (which self-filters by desiredSequence) draws whatever
+// comes back, whenever it comes back.
+function requestFlush(session: WebCodecsSession) {
+  session.decoder.flush().catch(() => {
+    // Rejects on reset()/close() racing the flush — already handled there.
+  });
+}
+
+async function fallbackToHtmlVideo(session: DecodeSession, source: Blob | string, error: unknown) {
+  if (activeSession !== session) return;
+  console.warn('WebCodecs playback failed during scrubbing; falling back to HTML video.', error);
+  teardownSession();
+  loading.hidden = false;
+  await loadWithHtmlVideo(source);
+}
+
+async function runDecodeLoop(session: DecodeSession, source: Blob | string) {
   while (activeSession === session) {
     const signalBefore = updateSignal;
     const timestamp = targetTimestamp;
@@ -448,7 +518,11 @@ async function runDecodeLoop(session: DecodeSession) {
       if (session.kind === 'html') await seekHtmlVideo(session, timestamp);
       else await decodeToTimestamp(session, timestamp);
     } catch (error) {
-      if (activeSession === session) console.error(error);
+      if (session.kind === 'webcodecs') {
+        await fallbackToHtmlVideo(session, source, error);
+      } else if (activeSession === session) {
+        console.error(error);
+      }
       break;
     }
 
