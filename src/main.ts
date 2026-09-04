@@ -3,9 +3,11 @@ import {
   ALL_FORMATS,
   BlobSource,
   UrlSource,
-  VideoSampleSink,
+  EncodedPacketSink,
+  VideoSample,
   Input,
   type InputVideoTrack,
+  type Rotation,
 } from 'mediabunny';
 import './style.css';
 
@@ -61,15 +63,103 @@ const status = document.querySelector<HTMLDivElement>('#status')!;
 const lenisToggle = document.querySelector<HTMLInputElement>('#lenis-toggle')!;
 const fileInput = document.querySelector<HTMLInputElement>('#video-file')!;
 
+// Budget for the decoded-frame cache: cap by estimated memory rather than a
+// fixed frame count, so a 4K upload doesn't try to hold as many frames as a
+// 720p one. ~2 bytes/pixel covers 4:2:0 chroma-subsampled video with margin.
+const FRAME_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+
+// A VideoDecoder kept alive for the whole scrub session, plus the packet
+// sink used to feed it. VideoDecoder.flush() requires the next decode() call
+// to be a key frame, so a *fresh* seek still redecodes from the nearest key
+// frame forward (same total decode work as VideoSampleSink.getSample()) —
+// keeping the decoder alive only avoids reconfiguring/closing it on every
+// single scrub frame. What actually avoids the redecode is `frameCache`:
+// every frame produced while walking from a key frame to a target is kept
+// (LRU-bounded by `maxCachedFrames`), so re-visiting anywhere in an
+// already-decoded stretch — the common case when scrubbing back and forth —
+// is a plain cache hit with no decoder involved at all.
+type DecodeSession = {
+  packetSink: EncodedPacketSink;
+  decoder: VideoDecoder;
+  rotation: Rotation;
+  displayWidth: number;
+  displayHeight: number;
+  latestFrame: VideoFrame | null;
+  frameCache: Map<number, VideoFrame>; // keyed by EncodedPacket.sequenceNumber, in LRU order
+  maxCachedFrames: number;
+  // Maps an in-flight decode chunk's timestamp (microseconds) back to the
+  // packet it came from, so the decoder's output callback knows which cache
+  // key to store each produced frame under.
+  pendingSequenceByTimestamp: Map<number, number>;
+};
+
+function cacheGet(session: DecodeSession, sequenceNumber: number): VideoFrame | undefined {
+  const frame = session.frameCache.get(sequenceNumber);
+  if (frame) {
+    // Bump to most-recently-used by reinserting (Map preserves insertion order).
+    session.frameCache.delete(sequenceNumber);
+    session.frameCache.set(sequenceNumber, frame);
+  }
+  return frame;
+}
+
+function cachePut(session: DecodeSession, sequenceNumber: number, frame: VideoFrame) {
+  session.frameCache.get(sequenceNumber)?.close();
+  session.frameCache.delete(sequenceNumber);
+  session.frameCache.set(sequenceNumber, frame);
+
+  while (session.frameCache.size > session.maxCachedFrames) {
+    const oldestKey = session.frameCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    session.frameCache.get(oldestKey)?.close();
+    session.frameCache.delete(oldestKey);
+  }
+}
+
+// Draws a frame and closes it (and its VideoSample wrapper) immediately.
+// Every VideoSample MUST be closed synchronously like this: mediabunny's
+// finalizer closes the *underlying* VideoFrame whenever an unclosed
+// VideoSample wrapper gets garbage collected, regardless of whether anything
+// else — like frameCache — still needs that frame. An uncollected wrapper
+// around a cached frame would silently invalidate it at some random future
+// GC pause. So this always takes ownership; draw a cached frame via a
+// disposable clone() instead of calling this directly on the cached frame.
+function drawAndCloseFrame(session: DecodeSession, frame: VideoFrame) {
+  const sample = new VideoSample(frame, {
+    rotation: session.rotation,
+    displayWidth: session.displayWidth,
+    displayHeight: session.displayHeight,
+    timestamp: frame.timestamp / 1e6,
+  });
+  sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+  sample.close();
+}
+
 let input: Input | null = null;
 let track: InputVideoTrack | null = null;
-let sink: VideoSampleSink | null = null;
+let activeSession: DecodeSession | null = null;
 let duration = 0;
 let targetTimestamp = 0;
 let decodedTimestamp = -1;
-let pumping = false;
 let sourceUrl: string | null = null;
 let lenis: Lenis | null = null;
+
+// Woken up whenever targetTimestamp changes (or the session is torn down), so
+// the decode loop below can react without polling.
+let updateSignal = 0;
+let wakeResolvers: Array<() => void> = [];
+
+function wake() {
+  updateSignal++;
+  const resolvers = wakeResolvers;
+  wakeResolvers = [];
+  for (const resolve of resolvers) resolve();
+}
+
+function waitForWake(signalBefore: number): Promise<void> {
+  if (updateSignal !== signalBefore) return Promise.resolve();
+  return new Promise((resolve) => wakeResolvers.push(resolve));
+}
 
 async function loadVideo(source: Blob | string) {
   loading.hidden = false;
@@ -78,13 +168,13 @@ async function loadVideo(source: Blob | string) {
   input?.dispose();
   input = null;
   track = null;
-  sink = null;
+  activeSession?.latestFrame?.close();
+  for (const frame of activeSession?.frameCache.values() ?? []) frame.close();
+  activeSession?.decoder.close();
+  activeSession = null;
   targetTimestamp = 0;
   decodedTimestamp = -1;
-
-  while (pumping) {
-    await new Promise<void>((resolve) => queueMicrotask(resolve));
-  }
+  wake();
 
   const mediaSource = typeof source === 'string'
     ? new UrlSource(source)
@@ -102,64 +192,116 @@ async function loadVideo(source: Blob | string) {
   if (!canDecode) throw new Error('This browser cannot decode this video with Mediabunny/WebCodecs.');
 
   duration = await track.computeDuration();
-  const width = await track.getDisplayWidth();
-  const height = await track.getDisplayHeight();
+  const displayWidth = await track.getDisplayWidth();
+  const displayHeight = await track.getDisplayHeight();
+  const rotation = await track.getRotation();
+  const decoderConfig = await track.getDecoderConfig();
+  if (!decoderConfig) throw new Error('Could not determine a decoder configuration for this track.');
 
-  canvas.width = width;
-  canvas.height = height;
-  // One VideoSampleSink; getSample still opens a decoder per call, so we
-  // never run more than one of those at a time (see pumpFrames).
-  sink = new VideoSampleSink(track, {
-    optimizeForLatency: true,
-  });
+  canvas.width = displayWidth;
+  canvas.height = displayHeight;
+
+  const bytesPerFrame = Math.max(1, displayWidth * displayHeight * 2);
+  const maxCachedFrames = Math.max(8, Math.floor(FRAME_CACHE_BUDGET_BYTES / bytesPerFrame));
+
+  const session: DecodeSession = {
+    packetSink: new EncodedPacketSink(track),
+    decoder: new VideoDecoder({
+      output: (frame) => {
+        const sequenceNumber = session.pendingSequenceByTimestamp.get(frame.timestamp);
+        if (sequenceNumber !== undefined) {
+          cachePut(session, sequenceNumber, frame.clone());
+        }
+
+        session.latestFrame?.close();
+        session.latestFrame = frame;
+      },
+      error: (error) => console.error(error),
+    }),
+    rotation,
+    displayWidth,
+    displayHeight,
+    latestFrame: null,
+    frameCache: new Map(),
+    maxCachedFrames,
+    pendingSequenceByTimestamp: new Map(),
+  };
+  session.decoder.configure({ ...decoderConfig, optimizeForLatency: true });
+  activeSession = session;
 
   loading.textContent = 'Ready';
   loading.hidden = true;
-  await pumpFrames();
+  void runDecodeLoop(session);
 }
 
 function timestampEpsilon() {
   return duration > 0 ? Math.max(duration / 10_000, 1 / 240) : 1 / 240;
 }
 
-async function pumpFrames() {
-  if (pumping || !sink || duration <= 0) return;
-  pumping = true;
+// Decodes from the nearest key frame forward to `timestamp` on the session's
+// persistent decoder, unless that exact frame is already in `frameCache` —
+// in which case this is just a cache read, no decoder involved. On a miss,
+// VideoDecoder.flush() requires the next decode() to be a key frame, so the
+// walk always starts there; every frame produced along the way gets cached
+// (see the decoder's `output` handler in loadVideo), so revisiting any point
+// in this same stretch later is a hit.
+async function decodeToTimestamp(session: DecodeSession, timestamp: number) {
+  const targetPacket = await session.packetSink.getPacket(timestamp);
+  if (!targetPacket) return;
 
-  try {
-    while (sink) {
-      const timestamp = targetTimestamp;
-      if (Math.abs(timestamp - decodedTimestamp) < timestampEpsilon()) break;
-
-      const activeSink = sink;
-      let sample = null;
-      try {
-        sample = await activeSink.getSample(timestamp);
-      } catch (error) {
-        if (!sink) break;
-        console.error(error);
-        decodedTimestamp = timestamp;
-        break;
-      }
-
-      if (!sink) {
-        sample?.close();
-        break;
-      }
-
-      if (sample) {
-        sample.draw(ctx, 0, 0, canvas.width, canvas.height);
-        sample.close();
-      }
-
-      decodedTimestamp = timestamp;
-    }
-  } finally {
-    pumping = false;
+  const cached = cacheGet(session, targetPacket.sequenceNumber);
+  if (cached) {
+    drawAndCloseFrame(session, cached.clone());
+    return;
   }
 
-  if (sink && Math.abs(targetTimestamp - decodedTimestamp) >= timestampEpsilon()) {
-    void pumpFrames();
+  const keyPacket = await session.packetSink.getKeyPacket(timestamp);
+  if (!keyPacket) return;
+
+  session.pendingSequenceByTimestamp.clear();
+
+  const keyChunk = keyPacket.toEncodedVideoChunk();
+  session.pendingSequenceByTimestamp.set(keyChunk.timestamp, keyPacket.sequenceNumber);
+  session.decoder.decode(keyChunk);
+  let cursor = keyPacket;
+
+  while (cursor.sequenceNumber < targetPacket.sequenceNumber) {
+    const next = await session.packetSink.getNextPacket(cursor);
+    if (!next) break;
+    const chunk = next.toEncodedVideoChunk();
+    session.pendingSequenceByTimestamp.set(chunk.timestamp, next.sequenceNumber);
+    session.decoder.decode(chunk);
+    cursor = next;
+  }
+
+  await session.decoder.flush();
+  session.pendingSequenceByTimestamp.clear();
+
+  if (session.latestFrame) {
+    const frame = session.latestFrame;
+    session.latestFrame = null;
+    drawAndCloseFrame(session, frame);
+  }
+}
+
+async function runDecodeLoop(session: DecodeSession) {
+  while (activeSession === session) {
+    const signalBefore = updateSignal;
+    const timestamp = targetTimestamp;
+
+    if (Math.abs(timestamp - decodedTimestamp) < timestampEpsilon()) {
+      await waitForWake(signalBefore);
+      continue;
+    }
+
+    try {
+      await decodeToTimestamp(session, timestamp);
+    } catch (error) {
+      if (activeSession === session) console.error(error);
+      break;
+    }
+
+    if (activeSession === session) decodedTimestamp = timestamp;
   }
 }
 
@@ -171,10 +313,10 @@ function getNativeProgress() {
 function updateFromProgress(progress: number) {
   const clamped = Math.min(1, Math.max(0, progress));
   status.textContent = `${(clamped * duration).toFixed(2)}s · ${(clamped * 100).toFixed(1)}%`;
-  if (duration <= 0 || !sink) return;
+  if (duration <= 0 || !activeSession) return;
 
   targetTimestamp = clamped * duration;
-  void pumpFrames();
+  wake();
 }
 
 function onLenisScroll({ scroll, limit }: { scroll: number; limit: number }) {
