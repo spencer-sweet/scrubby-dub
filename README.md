@@ -54,7 +54,7 @@ For a production scroll sequence:
      (keyframe count — compare against total frame count for the average GOP length)
    - Nothing publishes until the resulting changes are committed and pushed — review with `git status`/`git diff --stat` first.
 2. Test H.264/AVC first for broad WebCodecs availability.
-3. Benchmark Safari/iOS and **Chrome on Android** separately. Chrome Android often exposes `VideoDecoder` but cannot actually decode the Mediabunny/WebCodecs path. This demo uses an inline `<video>` seek fallback on Android (and other coarse-pointer devices), marked with an orange border. Encode with `-bf 0` (no B-frames) and `+faststart` when you want WebCodecs hardware decode to have a chance — `optimize.sh` does that.
+3. Benchmark Safari/iOS and **Chrome on Android** separately. Chrome Android often exposes `VideoDecoder` but cannot actually decode the Mediabunny/WebCodecs path (High-profile H.264, B-frames, MediaCodec glue). This demo uses an inline `<video>` seek fallback on Android, and the same fallback anywhere `canDecode()` / `configure()` fails. Encode with `-bf 0` (no B-frames) and `+faststart` when you want WebCodecs hardware decode to have a chance — `optimize.sh` does that.
 4. Keep the decoder work out of the render path where possible and only paint the newest completed frame.
 5. If the source is very long or very high resolution, consider a dedicated worker/rendering architecture and lower-resolution preview assets.
 
