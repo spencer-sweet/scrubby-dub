@@ -6,7 +6,6 @@ import {
   EncodedPacketSink,
   VideoSample,
   Input,
-  type InputVideoTrack,
   type Rotation,
 } from 'mediabunny';
 import './style.css';
@@ -33,7 +32,7 @@ app.innerHTML = `
         </div>
         <div class="controls">
           <label class="toggle">
-            <input id="lenis-toggle" type="checkbox" checked />
+            <input id="lenis-toggle" type="checkbox" />
             <span class="switch"></span>
             <span>Use Lenis</span>
           </label>
@@ -46,6 +45,18 @@ app.innerHTML = `
 
       <div class="scrub-stage">
         <canvas id="video-canvas" aria-label="Scroll scrubbed video"></canvas>
+        <div class="scrub-fallback" id="scrub-fallback">
+          <video
+            id="fallback-video"
+            class="scrub-video"
+            muted
+            playsinline
+            preload="auto"
+            crossorigin="anonymous"
+            disablepictureinpicture
+          ></video>
+          <p class="fallback-note">HTML video fallback</p>
+        </div>
         <div class="loading" id="loading">Loading video…</div>
         <div class="status" id="status">0.0s · 0%</div>
       </div>
@@ -57,16 +68,35 @@ app.innerHTML = `
 `;
 
 const canvas = document.querySelector<HTMLCanvasElement>('#video-canvas')!;
-const ctx = canvas.getContext('2d', { alpha: false })!;
+const ctx = canvas.getContext('2d', { alpha: false }) ?? canvas.getContext('2d')!;
+const htmlVideo = document.querySelector<HTMLVideoElement>('#fallback-video')!;
+const fallbackWrap = document.querySelector<HTMLDivElement>('#scrub-fallback')!;
 const loading = document.querySelector<HTMLDivElement>('#loading')!;
 const status = document.querySelector<HTMLDivElement>('#status')!;
 const lenisToggle = document.querySelector<HTMLInputElement>('#lenis-toggle')!;
 const fileInput = document.querySelector<HTMLInputElement>('#video-file')!;
 
+htmlVideo.playsInline = true;
+htmlVideo.muted = true;
+htmlVideo.setAttribute('webkit-playsinline', 'true');
+htmlVideo.controls = false;
+htmlVideo.hidden = true;
+
+const isAndroid = /Android/i.test(navigator.userAgent);
+const isCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
+
+// Chrome on Android exposes VideoDecoder but MediaCodec/WebCodecs often
+// rejects the H.264 configs Mediabunny feeds it (High profile, B-frames),
+// or configure() succeeds and decode then fails silently. The HTML <video>
+// element uses the same platform decoder through a path that actually works.
+function preferHtmlVideoPlayback() {
+  return isAndroid || typeof VideoDecoder !== 'function';
+}
+
 // Budget for the decoded-frame cache: cap by estimated memory rather than a
 // fixed frame count, so a 4K upload doesn't try to hold as many frames as a
 // 720p one. ~2 bytes/pixel covers 4:2:0 chroma-subsampled video with margin.
-const FRAME_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+const FRAME_CACHE_BUDGET_BYTES = (isAndroid ? 48 : 256) * 1024 * 1024;
 
 // A VideoDecoder kept alive for the whole scrub session, plus the packet
 // sink used to feed it. VideoDecoder.flush() requires the next decode() call
@@ -78,7 +108,8 @@ const FRAME_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
 // (LRU-bounded by `maxCachedFrames`), so re-visiting anywhere in an
 // already-decoded stretch — the common case when scrubbing back and forth —
 // is a plain cache hit with no decoder involved at all.
-type DecodeSession = {
+type WebCodecsSession = {
+  kind: 'webcodecs';
   packetSink: EncodedPacketSink;
   decoder: VideoDecoder;
   rotation: Rotation;
@@ -93,7 +124,15 @@ type DecodeSession = {
   pendingSequenceByTimestamp: Map<number, number>;
 };
 
-function cacheGet(session: DecodeSession, sequenceNumber: number): VideoFrame | undefined {
+type HtmlVideoSession = {
+  kind: 'html';
+  video: HTMLVideoElement;
+  seekGeneration: number;
+};
+
+type DecodeSession = WebCodecsSession | HtmlVideoSession;
+
+function cacheGet(session: WebCodecsSession, sequenceNumber: number): VideoFrame | undefined {
   const frame = session.frameCache.get(sequenceNumber);
   if (frame) {
     // Bump to most-recently-used by reinserting (Map preserves insertion order).
@@ -103,7 +142,7 @@ function cacheGet(session: DecodeSession, sequenceNumber: number): VideoFrame | 
   return frame;
 }
 
-function cachePut(session: DecodeSession, sequenceNumber: number, frame: VideoFrame) {
+function cachePut(session: WebCodecsSession, sequenceNumber: number, frame: VideoFrame) {
   session.frameCache.get(sequenceNumber)?.close();
   session.frameCache.delete(sequenceNumber);
   session.frameCache.set(sequenceNumber, frame);
@@ -124,7 +163,7 @@ function cachePut(session: DecodeSession, sequenceNumber: number, frame: VideoFr
 // around a cached frame would silently invalidate it at some random future
 // GC pause. So this always takes ownership; draw a cached frame via a
 // disposable clone() instead of calling this directly on the cached frame.
-function drawAndCloseFrame(session: DecodeSession, frame: VideoFrame) {
+function drawAndCloseFrame(session: WebCodecsSession, frame: VideoFrame) {
   const sample = new VideoSample(frame, {
     rotation: session.rotation,
     displayWidth: session.displayWidth,
@@ -136,7 +175,6 @@ function drawAndCloseFrame(session: DecodeSession, frame: VideoFrame) {
 }
 
 let input: Input | null = null;
-let track: InputVideoTrack | null = null;
 let activeSession: DecodeSession | null = null;
 let duration = 0;
 let targetTimestamp = 0;
@@ -161,20 +199,127 @@ function waitForWake(signalBefore: number): Promise<void> {
   return new Promise((resolve) => wakeResolvers.push(resolve));
 }
 
-async function loadVideo(source: Blob | string) {
-  loading.hidden = false;
-  loading.textContent = 'Reading video…';
+function setPlaybackSurface(mode: 'webcodecs' | 'html') {
+  const html = mode === 'html';
+  htmlVideo.hidden = !html;
+  htmlVideo.classList.toggle('is-active', html);
+  fallbackWrap.classList.toggle('is-active', html);
+  canvas.hidden = html;
+  canvas.classList.toggle('is-hidden', html);
+}
+
+function teardownSession() {
+  if (activeSession?.kind === 'webcodecs') {
+    activeSession.latestFrame?.close();
+    for (const frame of activeSession.frameCache.values()) frame.close();
+    try {
+      activeSession.decoder.close();
+    } catch {
+      // Already closed.
+    }
+  }
 
   input?.dispose();
   input = null;
-  track = null;
-  activeSession?.latestFrame?.close();
-  for (const frame of activeSession?.frameCache.values() ?? []) frame.close();
-  activeSession?.decoder.close();
   activeSession = null;
   targetTimestamp = 0;
   decodedTimestamp = -1;
+  duration = 0;
   wake();
+
+  htmlVideo.pause();
+  htmlVideo.removeAttribute('src');
+  htmlVideo.load();
+  setPlaybackSurface('webcodecs');
+}
+
+async function configureDecoder(decoder: VideoDecoder, base: VideoDecoderConfig) {
+  const attempts: VideoDecoderConfig[] = [
+    { ...base, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' },
+    { ...base, hardwareAcceleration: 'prefer-software' },
+    { ...base, optimizeForLatency: true },
+    base,
+  ];
+
+  for (const config of attempts) {
+    try {
+      if (typeof VideoDecoder.isConfigSupported === 'function') {
+        const { supported } = await VideoDecoder.isConfigSupported(config);
+        if (!supported) continue;
+      }
+      decoder.configure(config);
+      return;
+    } catch {
+      // Try the next, more conservative config.
+    }
+  }
+
+  throw new Error('Could not configure a WebCodecs video decoder.');
+}
+
+function waitForVideoEvent(video: HTMLVideoElement, event: string) {
+  return new Promise<void>((resolve, reject) => {
+    const onEvent = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(video.error ?? new Error(`Video failed during ${event}.`));
+    };
+    const cleanup = () => {
+      video.removeEventListener(event, onEvent);
+      video.removeEventListener('error', onError);
+    };
+    video.addEventListener(event, onEvent, { once: true });
+    video.addEventListener('error', onError, { once: true });
+  });
+}
+
+async function loadWithHtmlVideo(source: Blob | string) {
+  loading.textContent = 'Preparing video…';
+  setPlaybackSurface('html');
+
+  const url = typeof source === 'string'
+    ? source
+    : (sourceUrl = URL.createObjectURL(source));
+
+  htmlVideo.src = url;
+  htmlVideo.load();
+  await waitForVideoEvent(htmlVideo, 'loadedmetadata');
+
+  if (!Number.isFinite(htmlVideo.duration) || htmlVideo.duration <= 0) {
+    throw new Error('Could not read video duration.');
+  }
+
+  duration = htmlVideo.duration;
+  canvas.width = htmlVideo.videoWidth || 1280;
+  canvas.height = htmlVideo.videoHeight || 720;
+
+  // Android Chrome often will not paint a frame until playback has started
+  // at least once, even for a muted inline video.
+  try {
+    await htmlVideo.play();
+    htmlVideo.pause();
+  } catch {
+    // Autoplay may still be blocked; seeking usually works after metadata.
+  }
+
+  const session: HtmlVideoSession = {
+    kind: 'html',
+    video: htmlVideo,
+    seekGeneration: 0,
+  };
+  activeSession = session;
+  loading.textContent = 'Ready';
+  loading.hidden = true;
+  updateFromProgress(getNativeProgress());
+  void runDecodeLoop(session);
+}
+
+async function loadWithWebCodecs(source: Blob | string) {
+  loading.textContent = 'Reading video…';
+  setPlaybackSurface('webcodecs');
 
   const mediaSource = typeof source === 'string'
     ? new UrlSource(source)
@@ -185,7 +330,7 @@ async function loadVideo(source: Blob | string) {
     formats: ALL_FORMATS,
   });
 
-  track = await input.getPrimaryVideoTrack();
+  const track = await input.getPrimaryVideoTrack();
   if (!track) throw new Error('No video track found.');
 
   const canDecode = await track.canDecode();
@@ -204,7 +349,8 @@ async function loadVideo(source: Blob | string) {
   const bytesPerFrame = Math.max(1, displayWidth * displayHeight * 2);
   const maxCachedFrames = Math.max(8, Math.floor(FRAME_CACHE_BUDGET_BYTES / bytesPerFrame));
 
-  const session: DecodeSession = {
+  const session: WebCodecsSession = {
+    kind: 'webcodecs',
     packetSink: new EncodedPacketSink(track),
     decoder: new VideoDecoder({
       output: (frame) => {
@@ -226,16 +372,54 @@ async function loadVideo(source: Blob | string) {
     maxCachedFrames,
     pendingSequenceByTimestamp: new Map(),
   };
-  session.decoder.configure({ ...decoderConfig, optimizeForLatency: true });
+  await configureDecoder(session.decoder, decoderConfig);
   activeSession = session;
 
   loading.textContent = 'Ready';
   loading.hidden = true;
+  updateFromProgress(getNativeProgress());
   void runDecodeLoop(session);
+}
+
+async function loadVideo(source: Blob | string) {
+  loading.hidden = false;
+  loading.textContent = 'Reading video…';
+
+  teardownSession();
+
+  if (preferHtmlVideoPlayback()) {
+    await loadWithHtmlVideo(source);
+    return;
+  }
+
+  try {
+    await loadWithWebCodecs(source);
+  } catch (error) {
+    console.warn('WebCodecs playback failed; falling back to HTML video.', error);
+    teardownSession();
+    loading.hidden = false;
+    await loadWithHtmlVideo(source);
+  }
 }
 
 function timestampEpsilon() {
   return duration > 0 ? Math.max(duration / 10_000, 1 / 240) : 1 / 240;
+}
+
+async function seekHtmlVideo(session: HtmlVideoSession, timestamp: number) {
+  const video = session.video;
+  const clamped = Math.min(Math.max(0, timestamp), Math.max(0, duration - 0.001));
+  const generation = ++session.seekGeneration;
+
+  if (Math.abs(video.currentTime - clamped) < 0.001 && video.readyState >= 2) {
+    return;
+  }
+
+  const seeked = waitForVideoEvent(video, 'seeked');
+  video.currentTime = clamped;
+  await seeked;
+
+  if (generation !== session.seekGeneration) return;
 }
 
 // Decodes from the nearest key frame forward to `timestamp` on the session's
@@ -245,7 +429,7 @@ function timestampEpsilon() {
 // walk always starts there; every frame produced along the way gets cached
 // (see the decoder's `output` handler in loadVideo), so revisiting any point
 // in this same stretch later is a hit.
-async function decodeToTimestamp(session: DecodeSession, timestamp: number) {
+async function decodeToTimestamp(session: WebCodecsSession, timestamp: number) {
   const targetPacket = await session.packetSink.getPacket(timestamp);
   if (!targetPacket) return;
 
@@ -295,7 +479,8 @@ async function runDecodeLoop(session: DecodeSession) {
     }
 
     try {
-      await decodeToTimestamp(session, timestamp);
+      if (session.kind === 'html') await seekHtmlVideo(session, timestamp);
+      else await decodeToTimestamp(session, timestamp);
     } catch (error) {
       if (activeSession === session) console.error(error);
       break;
@@ -306,8 +491,10 @@ async function runDecodeLoop(session: DecodeSession) {
 }
 
 function getNativeProgress() {
-  const max = document.documentElement.scrollHeight - window.innerHeight;
-  return max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0;
+  const scrolling = document.scrollingElement ?? document.documentElement;
+  const top = scrolling.scrollTop || window.scrollY || window.pageYOffset || 0;
+  const max = scrolling.scrollHeight - window.innerHeight;
+  return max > 0 ? Math.min(1, Math.max(0, top / max)) : 0;
 }
 
 function updateFromProgress(progress: number) {
@@ -329,6 +516,10 @@ function enableLenis() {
   lenis = new Lenis({
     autoRaf: false,
     lerp: 0.1,
+    // Android Chrome needs Lenis to own touch, otherwise preventDefault on
+    // wheel/touch can leave the page unable to scroll at all.
+    syncTouch: true,
+    touchMultiplier: 1,
   });
   lenis.on('scroll', onLenisScroll);
   lenis.scrollTo(window.scrollY, { immediate: true });
@@ -352,12 +543,17 @@ window.addEventListener('scroll', () => {
   if (!lenis) updateFromProgress(getNativeProgress());
 }, { passive: true });
 
+window.addEventListener('touchend', () => {
+  if (!lenis) updateFromProgress(getNativeProgress());
+}, { passive: true });
+
 function raf(time: number) {
   lenis?.raf(time);
   requestAnimationFrame(raf);
 }
 requestAnimationFrame(raf);
 
+lenisToggle.checked = !isAndroid && !isCoarsePointer;
 lenisToggle.addEventListener('change', () => {
   setLenisEnabled(lenisToggle.checked);
 });
@@ -370,7 +566,7 @@ fileInput.addEventListener('change', async () => {
 
   try {
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    sourceUrl = URL.createObjectURL(file);
+    sourceUrl = null;
     await loadVideo(file);
   } catch (error) {
     loading.hidden = false;
@@ -385,6 +581,6 @@ window.addEventListener('resize', () => {
 
 loadVideo(`${import.meta.env.BASE_URL}7d-200fps.mp4`).catch((error) => {
   loading.hidden = false;
-  loading.textContent = 'Demo video failed to load. Choose a video above.';
+  loading.textContent = error instanceof Error ? error.message : 'Demo video failed to load. Choose a video above.';
   console.error(error);
 });
